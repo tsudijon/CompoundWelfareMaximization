@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributions as dist
+from scipy.integrate import cumtrapz
 
 import matplotlib.pyplot as plt
 
@@ -40,6 +41,7 @@ def coupled_bootstrap(Xs, sigmas,eps = 1, lb = -5, ub = 5):
     eps: tuning parameter for the coupled bootstrap risk
     """
     n = len(Xs)
+    eps = 1./n**0.2
 
     C_grid = np.linspace(lb, ub, 500)
 
@@ -58,6 +60,39 @@ def coupled_bootstrap(Xs, sigmas,eps = 1, lb = -5, ub = 5):
         F2 = sigmas*norm.pdf((Xs - c*sigmas)/(eps*sigmas))/eps
         welfare_curve[i] = F1.sum() - F2.sum()
     return welfare_curve
+
+
+#### Integrated SURGE Estimates
+
+def integrated_surge(Xs, sigmas, lb = -5, ub = 5, grid_points = 1000, type = 0):
+    n = len(Xs)
+    C_grid = np.linspace(lb, ub, grid_points)
+    bandwidth = np.sqrt(2*np.log(n))
+
+    def fie(x):
+        return np.sin(bandwidth*x)/(np.pi*x)
+
+    def dv_fie(x):
+        return (bandwidth*x*np.cos(bandwidth*x) - np.sin(bandwidth*x))/(np.pi*x**2)
+
+    surge_estimate = np.zeros_like(C_grid).astype(float)
+
+    for i in np.arange(len(C_grid)):
+        c = C_grid[i]
+        
+        if type == 0:
+            F1 = sigmas*dv_fie(Xs/sigmas - c)
+            F2 = Xs*fie(Xs/sigmas - c)
+
+        else:
+            F1 = sigmas*dv_fie(Xs/sigmas - c)
+            F2 = c*sigmas*fie(Xs/sigmas - c)
+
+        surge_estimate[i] = -F1.sum() - F2.sum()
+
+    integrated_surge = cumtrapz(surge_estimate, C_grid, initial=0)
+    return integrated_surge
+
 
 
 #### Near-Unbiased Welfare Estimates 
@@ -123,15 +158,12 @@ class OneLayerNN(nn.Module):
         return dist.Normal(0, 1).cdf(z)
 
     def forward(self, x):
-        # Ensure x is a 1D tensor of shape (N,) where N=2000.
-        # Expand dimensions for broadcasting:
-        w_expanded = self.w.unsqueeze(0)  # Shape: (1, 200)
-        x_expanded = x.unsqueeze(1)         # Shape: (2000, 1)
+        # Ensure x is a 1D tensor of shape (N,) 
+        w_expanded = self.w.unsqueeze(0)  
+        x_expanded = x.unsqueeze(1)       
 
-        # Now w_expanded - x_expanded will have shape (2000, 200)
         result = w_expanded * self.gaussian_cdf(w_expanded/self.sigmas - x_expanded)
 
-        # Sum over the hidden units dimension (the last dimension, 200)
         return torch.sum(result, dim=-1)
 
 
@@ -164,9 +196,64 @@ def smoothen_via_nn(ure, sigmas, n, grid):
       loss.backward()
       optimizer.step()
 
-      if epoch % 100 == 0:
-          print(f"Epoch {epoch}, Loss: {loss.item():.4f}")
-
-  print("Training complete.")
 
   return y_pred
+
+
+
+#############################
+##### Visualization #########
+#############################
+
+def compare_insample_welfares(welfares, labels, title):
+    """
+    welfares: list of arrays
+    labels: list of strings
+    """
+
+    # Create figure and axis
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Create boxplots
+    box_data = welfares
+
+    # Box plot with customization
+    boxplot = ax.boxplot(box_data, patch_artist=True, labels=labels)
+
+    # Generate colors based on the number of boxes
+    colors = plt.cm.Set3(np.linspace(0, 1, len(box_data)))
+    for box, color in zip(boxplot['boxes'], colors):
+        box.set(facecolor=color, alpha=0.7)
+        
+    # Add a horizontal grid for better readability
+    ax.yaxis.grid(True, linestyle='--', alpha=0.7)
+
+    # Add labels and title
+    ax.set_title('Algorithm Performance Comparison', fontsize=16, pad=20)
+    ax.set_ylabel('Welfare', fontsize=14)
+    ax.set_xlabel('Algorithms', fontsize=14)
+
+    # Add some padding to y-axis for better visualization
+    y_min = min([min(data) for data in box_data])
+    y_max = max([max(data) for data in box_data])
+    padding = (y_max - y_min) * 0.1
+    ax.set_ylim(y_min - padding, y_max + padding)
+
+    # Optional: Add data points
+    for i, data in enumerate(box_data):
+        # Add a small horizontal jitter to better visualize the points
+        x = np.random.normal(i+1, 0.02, size=len(data))
+        ax.scatter(x, data, alpha=0.5, s=5, color='black')
+
+    # Add some statistics in the plot
+    for i, data in enumerate(box_data):
+        stats_text = f"Mean: {np.mean(data):.2f}\nStd: {np.std(data):.2f}"
+        ax.annotate(stats_text, xy=(i+1, y_max), xytext=(0, -10),
+                    textcoords='offset points', ha='center', fontsize=12,
+                    bbox=dict(boxstyle='round,pad=0.5', fc='yellow', alpha=0.1))
+
+    plt.tight_layout()
+    #plt.savefig(title, bbox_inches = 'tight')
+    plt.show()
+
+    return None
