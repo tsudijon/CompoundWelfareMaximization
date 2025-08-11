@@ -8,33 +8,9 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.distributions as dist
 from scipy.integrate import cumtrapz
+from scipy.special import sici  # returns (Si(x), Ci(x))
 
 import matplotlib.pyplot as plt
-
-def npmle_poisson(data):
-
-  m = 500
-  theta_grid = np.linspace(0.1, 50, m)
-  g = cp.Variable(m, nonneg=True)  # Probability mass function on the grid
-
-  # Constraints: g is a probability distribution
-  constraints = [cp.sum(g) == 1]
-
-  # Log-likelihood for the Poisson observations
-  W = poisson.pmf(data.reshape(-1,1), theta_grid)
-  log_likelihood = cp.sum(cp.log(W @ g))
-
-  objective = cp.Maximize(log_likelihood)
-  problem = cp.Problem(objective, constraints)
-  problem.solve(verbose = True)
-
-  return theta_grid, g
-
-def compute_post_expectation(y, theta_grid, g):
-  probs = poisson.pmf(y,theta_grid) * g.value
-  probs = probs/probs.sum()
-  return (theta_grid*probs).sum()
-
 
 def coupled_bootstrap(Xs, sigmas,eps = 1, lb = -5, ub = 5):
     """
@@ -43,15 +19,7 @@ def coupled_bootstrap(Xs, sigmas,eps = 1, lb = -5, ub = 5):
     n = len(Xs)
     eps = 1./n**0.2
 
-    C_grid = np.linspace(lb, ub, 500)
-
-    # # Compute pairwise differences
-    # d = Xs[:, None] - C_grid[None, :]
-    # d = d/(eps*sigmas[:,None])
-
-    # F_1 = (Xs[:,None]*norm.cdf(d)).sum(axis = 0)
-    # F_2 = ((sigmas[:,None]/eps)*norm.pdf(d)).sum(axis = 0)
-    # welfare_curve = F_1 - F_2
+    C_grid = np.linspace(lb, ub, 100)
 
     welfare_curve = np.zeros_like(C_grid).astype(float)
     for i in np.arange(len(C_grid)):
@@ -61,48 +29,75 @@ def coupled_bootstrap(Xs, sigmas,eps = 1, lb = -5, ub = 5):
         welfare_curve[i] = F1.sum() - F2.sum()
     return welfare_curve
 
-
-#### Integrated SURGE Estimates
-
-def integrated_surge(Xs, sigmas, lb = -5, ub = 5, grid_points = 1000, type = 0):
-    n = len(Xs)
-    C_grid = np.linspace(lb, ub, grid_points)
-    bandwidth = np.sqrt(2*np.log(n))
-
-    def fie(x):
-        return np.sin(bandwidth*x)/(np.pi*x)
-
-    def dv_fie(x):
-        return (bandwidth*x*np.cos(bandwidth*x) - np.sin(bandwidth*x))/(np.pi*x**2)
-
-    surge_estimate = np.zeros_like(C_grid).astype(float)
-
-    for i in np.arange(len(C_grid)):
-        c = C_grid[i]
-        
-        if type == 0:
-            F1 = sigmas*dv_fie(Xs/sigmas - c)
-            F2 = Xs*fie(Xs/sigmas - c)
-
-        else:
-            F1 = sigmas*dv_fie(Xs/sigmas - c)
-            F2 = c*sigmas*fie(Xs/sigmas - c)
-
-        surge_estimate[i] = -F1.sum() - F2.sum()
-
-    integrated_surge = cumtrapz(surge_estimate, C_grid, initial=0)
-    return integrated_surge
-
-
-
 #### Near-Unbiased Welfare Estimates 
 
+def dirichlet_normal_estimator(
+    Xs, sigmas, lb=-5, ub=5, true_effects=None, plot=False
+):
+    """
+    Vectorized welfare estimator using sine integral SI and unnormalized sinc(x) = sin(x)/(pi*x).
+
+    Parameters
+    ----------
+    Xs : array-like, shape (n,)
+        Observed estimates X_i.
+    sigmas : array-like, shape (n,)
+        Std devs sigma_i corresponding to X_i.
+    lb, ub : float
+        Grid bounds for decision threshold C.
+    true_effects : array-like, optional
+        If provided, plot the 'true' welfare curve used in your original template.
+    smoothen_nn : bool
+        If True, calls smoothen_via_nn(welfare_curve, sigmas, n, C_grid).
+    plot : bool
+        If True, plots the components and welfare curve.
+
+    Returns
+    -------
+    welfare_curve : ndarray, shape (m,)
+        Welfare evaluated on the C_grid.
+    """
+    Xs = np.asarray(Xs, dtype=float)
+    sigmas = np.asarray(sigmas, dtype=float)
+    ts = Xs/sigmas
+    n = len(Xs)
+    assert sigmas.shape == Xs.shape, "Xs and sigmas must have the same shape."
+
+    C_grid = np.linspace(lb, ub, 100)
+    m = C_grid.size
+
+    h_n = 1./np.sqrt(2 * np.log(n))
+    u = (ts[:, None] - C_grid[None, :]) / h_n
+
+    # SI(u): use scipy.special.sici, first element is Si
+    Si_u, _ = sici(u)
+    sinc_u = np.sinc(u / np.pi) / np.pi
+
+    T1 = 0.5 * np.sum(Xs) * np.ones(m)
+    T2 = (Xs[:, None] * Si_u).sum(axis=0) / np.pi
+    T3 = -((sigmas[:, None] / h_n) * sinc_u).sum(axis=0)
+
+    welfare_curve = T1 + T2 + T3
+
+    if true_effects is not None:
+        true_effects = np.asarray(true_effects, dtype=float)
+        assert true_effects.shape == Xs.shape, "true_effects must match Xs shape."
+        true_risk = np.zeros_like(C_grid)
+        te_over_sigma = true_effects / sigmas
+        for j in range(m):
+            true_risk[j] = np.sum(true_effects * norm.cdf(te_over_sigma - C_grid[j]))
+        if plot:
+            print("True Optimal Threshold:", C_grid[np.argmax(true_risk)])
+            plt.plot(C_grid, true_risk, color="red", linestyle="dashed", alpha=0.6, label="True Welfare")
+    if plot:
+        plt.legend()
+    return welfare_curve
 
 def heteroskedastic_normal_welfare_estimator(Xs, sigmas,lb = -5, ub = 5, true_effects = None, smoothen_nn = False, plot = False):
     n = len(Xs)
     ts = Xs/sigmas
 
-    C_grid = np.linspace(lb, ub, 500)
+    C_grid = np.linspace(lb, ub, 100)
 
     # Compute F_1: Sum of Xs for all elements greater than each C_grid point
     F_1 = np.sum(Xs[:, None] * (ts[:, None] >= C_grid), axis=0)
